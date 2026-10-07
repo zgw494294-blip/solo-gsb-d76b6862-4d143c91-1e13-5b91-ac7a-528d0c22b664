@@ -823,6 +823,396 @@ class RaceTests(unittest.TestCase):
                 appmod.CURRENT = None
 
 
+class BreakpointTests(unittest.TestCase):
+    """Source-line breakpoints for continue.
+
+    The first pause and single stepping ignore breakpoints; continue stops
+    only when a breakpoint source line is actually reached (before it runs),
+    re-hits inside loops stop again, but resuming from a pause can never
+    pause twice for the same arrival. The set travels with /api/run (illegal
+    values are 400 and start nothing), is reported by /api/state, and can be
+    replaced wholesale through POST /api/breakpoints only at a live,
+    unconsumed pause; the replacement neither advances code nor adds a pause
+    snapshot.
+    """
+
+    LOOP_BP_CODE = (
+        "total = 0\n"
+        "for i in range(3):\n"
+        "    total += i\n"
+        "print(total)\n")
+
+    def setUp(self):
+        self.client = appmod.app.test_client()
+        self.created = []
+        self._real_popen = appmod.subprocess.Popen
+
+        def tracking_popen(*args, **kwargs):
+            proc = self._real_popen(*args, **kwargs)
+            self.created.append(proc)
+            return proc
+
+        self._patch = mock.patch.object(appmod.subprocess, "Popen", tracking_popen)
+        self._patch.start()
+        with appmod.COND:
+            appmod.CURRENT = None
+
+    def tearDown(self):
+        self._patch.stop()
+        with appmod.COND:
+            current = appmod.CURRENT
+        if (current is not None and current.status in appmod.ACTIVE_STATES
+                and current.proc_started):
+            self.client.post("/api/terminate", json={"run_id": current.run_id})
+        for proc in self.created:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+    def state(self):
+        return self.client.get("/api/state").get_json()
+
+    def start_run(self, code=SIMPLE_CODE, breakpoints=None):
+        body = {"code": code}
+        if breakpoints is not None:
+            body["breakpoints"] = breakpoints
+        res = self.client.post("/api/run", json=body)
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        return res.get_json()["run_id"]
+
+    def wait_paused(self):
+        ok = wait_for(lambda: self.state()["status"] == "paused")
+        self.assertTrue(ok, f"never paused: {self.state()}")
+
+    def cleanup_run(self, run_id):
+        with appmod.COND:
+            proc = appmod.CURRENT.proc
+        res = self.client.post("/api/terminate", json={"run_id": run_id})
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        self.assertIsNotNone(proc.poll(), "child not reaped")
+
+    def cont(self, run_id, seq):
+        res = self.client.post(
+            "/api/continue", json={"run_id": run_id, "pause_seq": seq})
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+
+    def wait_line(self, line):
+        ok = wait_for(
+            lambda: self.state()["status"] == "paused"
+            and self.state()["current_line"] == line)
+        self.assertTrue(ok, f"never paused at line {line}: {self.state()}")
+
+    def wait_status(self, status):
+        ok = wait_for(lambda: self.state()["status"] == status)
+        self.assertTrue(ok, f"never reached {status}: {self.state()}")
+
+    # ---- validation -----------------------------------------------------
+
+    def test_run_rejects_illegal_breakpoints_without_starting(self):
+        n_procs = len(self.created)
+        bad_payloads = [
+            [0], [-1], [4], [1.0], [True], [False], ["1"], [None],
+            [1, 2, "x"], [[1]], [{"line": 1}], 99, "1,2",
+        ]
+        for bp in bad_payloads:
+            res = self.client.post("/api/run",
+                                   json={"code": "x = 1\ny = 2\n",
+                                         "breakpoints": bp})
+            self.assertEqual(res.status_code, 400, (bp, res.get_json()))
+        self.assertEqual(len(self.created), n_procs,
+                         "illegal breakpoints must not spawn a process")
+        self.assertIsNone(appmod.CURRENT,
+                          "illegal breakpoints must not register a run")
+        # A non-array JSON body is 400 rather than a 500.
+        res = self.client.post("/api/run",
+                               json={"code": "x = 1\n", "breakpoints": "2"})
+        self.assertEqual(res.status_code, 400)
+
+    def test_run_dedupes_sorts_and_omitted_means_empty(self):
+        run_id = self.start_run("x = 1\ny = 2\nz = 3\n",
+                                breakpoints=[3, 1, 1, 2])
+        self.wait_paused()
+        self.assertEqual(self.state()["breakpoints"], [1, 2, 3])
+        self.cleanup_run(run_id)
+
+        # Omitting the field is the empty set: continue runs to the end.
+        run_id = self.start_run("x = 1\nx = 2\n")
+        self.wait_paused()
+        self.assertEqual(self.state()["breakpoints"], [])
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_status("finished")
+
+    def test_breakpoints_endpoint_validation_and_409_contract(self):
+        run_id = self.start_run("x = 1\ny = 2\n", breakpoints=[1])
+        self.wait_paused()
+        seq = self.state()["pause_seq"]
+        url = "/api/breakpoints"
+
+        # Illegal sets are 400 and leave the configuration untouched.
+        for bad in ([3], [0], [1.5], [True], ["1"], [1, None], "x", 7):
+            res = self.client.post(url, json={
+                "run_id": run_id, "pause_seq": seq, "breakpoints": bad})
+            self.assertEqual(res.status_code, 400, (bad, res.get_json()))
+            self.assertEqual(self.state()["breakpoints"], [1])
+
+        # Stale run id is 409, even with a legal set.
+        res = self.client.post(url, json={
+            "run_id": "deadbeef", "pause_seq": seq, "breakpoints": [2]})
+        self.assertEqual(res.status_code, 409)
+        # Wrong pause_seq is 409.
+        res = self.client.post(url, json={
+            "run_id": run_id, "pause_seq": seq + 1, "breakpoints": [2]})
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(self.state()["breakpoints"], [1])
+
+        # Consume the pause with step; the same seq is now consumed -> 409.
+        self.assertEqual(self.client.post(
+            "/api/step", json={"run_id": run_id, "pause_seq": seq}
+        ).status_code, 200)
+        self.wait_line(2)
+        res = self.client.post(url, json={
+            "run_id": run_id, "pause_seq": seq, "breakpoints": [2]})
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(self.state()["breakpoints"], [1])
+        self.cleanup_run(run_id)
+
+        # Non-paused (terminal) runs are 409 and the set does not change.
+        run_id = self.start_run("x = 1\n", breakpoints=[])
+        self.wait_paused()
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_status("finished")
+        res = self.client.post(url, json={
+            "run_id": run_id, "pause_seq": seq, "breakpoints": [1]})
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(self.state()["breakpoints"], [])
+
+    def test_replace_at_pause_neither_advances_nor_adds_history(self):
+        run_id = self.start_run(self.LOOP_BP_CODE, breakpoints=[4])
+        self.wait_paused()  # first stop: line 1, unchanged by breakpoints
+        self.assertEqual(self.state()["current_line"], 1)
+        seq = self.state()["pause_seq"]
+
+        before = self.state()
+        res = self.client.post("/api/breakpoints", json={
+            "run_id": run_id, "pause_seq": seq,
+            "breakpoints": [3, 3, 2]})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.get_json()["breakpoints"], [2, 3])
+        after = self.state()
+        # Same pause, same line, still paused and unconsumed.
+        self.assertEqual(after["status"], "paused")
+        self.assertEqual(after["pause_seq"], before["pause_seq"])
+        self.assertEqual(after["current_line"], before["current_line"])
+        self.assertEqual(after["breakpoints"], [2, 3])
+        time.sleep(0.15)  # give a wrongly-advancing child time to misbehave
+        self.assertEqual(self.state()["pause_seq"], before["pause_seq"])
+        pauses = self.client.get(
+            f"/api/pauses?run_id={run_id}").get_json()["pauses"]
+        self.assertEqual([p["pause_seq"] for p in pauses], [1])
+
+        # Replacement can be repeated at the same pause and is repeatable
+        # without consuming it: step afterwards still works at this seq.
+        res = self.client.post("/api/breakpoints", json={
+            "run_id": run_id, "pause_seq": seq, "breakpoints": []})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self.client.post(
+            "/api/step", json={"run_id": run_id, "pause_seq": seq}
+        ).status_code, 200)
+        self.wait_line(2)
+        self.cleanup_run(run_id)
+
+    # ---- continue / hit semantics ---------------------------------------
+
+    def test_first_pause_and_step_ignore_breakpoints(self):
+        # A breakpoint at the first executable line must not add an extra
+        # first stop; there is exactly one initial pause at that line.
+        run_id = self.start_run("x = 1\nx = 2\nx = 3\n", breakpoints=[1, 2])
+        self.wait_paused()
+        self.assertEqual(self.state()["current_line"], 1)
+        self.assertEqual(self.state()["pause_seq"], 1)
+        seq = self.state()["pause_seq"]
+        # Step lands on line 2 even though it is a breakpoint line: stepping
+        # pauses on every source line regardless of the set.
+        self.assertEqual(self.client.post(
+            "/api/step", json={"run_id": run_id, "pause_seq": seq}
+        ).status_code, 200)
+        self.wait_line(2)
+        self.assertEqual(self.state()["pause_seq"], 2)
+        self.cleanup_run(run_id)
+
+    def test_continue_stops_at_each_loop_arrival_then_runs_to_end(self):
+        run_id = self.start_run(self.LOOP_BP_CODE, breakpoints=[3])
+        self.wait_paused()
+        self.assertEqual(self.state()["current_line"], 1)
+
+        # continue skips line 2 (the for-line is not a breakpoint) and stops
+        # at line 3 before it executes, once per iteration.
+        for iteration in range(3):
+            seq = self.state()["pause_seq"]
+            self.cont(run_id, seq)
+            self.wait_line(3)
+            # The line has not run yet at the moment of the pause: i is the
+            # current iteration index and total still holds prior iterations.
+            snap = self.state()
+            self.assertEqual(snap["locals"].get("i"), str(iteration))
+            self.assertEqual(snap["locals"].get("total"),
+                             str(sum(range(iteration))))
+        # Line 3 paused three times; continue once more -> print -> end.
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_status("finished")
+        self.assertTrue(appmod.CURRENT.reaped)
+        self.assertEqual(self.state()["stdout"], "3\n")
+        pauses = self.client.get(
+            f"/api/pauses?run_id={run_id}").get_json()["pauses"]
+        lines = [p["current_line"] for p in pauses]
+        self.assertEqual(lines, [1, 3, 3, 3])
+
+    def test_continue_does_not_pause_twice_at_same_arrival(self):
+        # Breakpoint at the first executable line: after the initial pause a
+        # continue must resume (not immediately re-pause at the same line)
+        # and stop at a later hit (line 2) only.
+        code = "x = 1\nfor i in range(1):\n    x = 2\n"
+        run_id = self.start_run(code, breakpoints=[1, 3])
+        self.wait_paused()
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        # The next pause is line 3 (loop body), never line 1 again.
+        self.wait_line(3)
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_status("finished")
+
+    def test_blank_and_comment_lines_never_hit(self):
+        code = "# a comment\n\nx = 1\n# mid comment\nx = 2\n"
+        run_id = self.start_run(code, breakpoints=[1, 2, 4, 5])
+        self.wait_paused()
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        # Line 5 is the only executable breakpoint line after the start.
+        self.wait_line(5)
+        # The stored set still includes the comment/blank numbers.
+        self.assertEqual(self.state()["breakpoints"], [1, 2, 4, 5])
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_status("finished")
+
+    def test_continue_without_breakpoints_runs_to_exception(self):
+        code = "x = 1\nraise ValueError('boom')\n"
+        run_id = self.start_run(code)  # omitted breakpoints -> empty
+        self.wait_paused()
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_status("exception")
+        self.assertIn("ValueError", self.state()["exception"] or "")
+
+    def test_replace_while_paused_changes_the_next_continue(self):
+        run_id = self.start_run(self.LOOP_BP_CODE, breakpoints=[4])
+        self.wait_paused()
+        seq = self.state()["pause_seq"]
+        # Redirect: stop at the loop body instead of the print.
+        res = self.client.post("/api/breakpoints", json={
+            "run_id": run_id, "pause_seq": seq, "breakpoints": [3]})
+        self.assertEqual(res.status_code, 200)
+        self.cont(run_id, seq)
+        self.wait_line(3)
+        # Remove all breakpoints at the hit: continue now runs to the end.
+        seq = self.state()["pause_seq"]
+        res = self.client.post("/api/breakpoints", json={
+            "run_id": run_id, "pause_seq": seq, "breakpoints": []})
+        self.assertEqual(res.status_code, 200)
+        self.cont(run_id, seq)
+        self.wait_status("finished")
+        self.assertEqual(self.state()["stdout"], "3\n")
+
+    def test_concurrent_breakpoint_replaces_keep_protocol_intact(self):
+        # Breakpoint replacement does not consume a pause, so many can be
+        # accepted concurrently. The io_lock must keep each JSON command in
+        # one intact line: the child must stay parked (no advance), accept
+        # the final set, and continue correctly afterwards.
+        run_id = self.start_run(self.LOOP_BP_CODE, breakpoints=[4])
+        self.wait_paused()
+        seq = self.state()["pause_seq"]
+
+        results = []
+        barrier = threading.Barrier(8)
+        sets = [[1], [2], [3], [4], [1, 2], [2, 3], [3, 4], [3]]
+
+        def replace(tag):
+            barrier.wait()
+            res = self.client.post("/api/breakpoints", json={
+                "run_id": run_id, "pause_seq": seq,
+                "breakpoints": sets[tag]})
+            results.append((tag, res.status_code,
+                            res.get_json().get("breakpoints")
+                            if res.is_json else None))
+
+        threads = [threading.Thread(target=replace, args=(i,))
+                   for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(code == 200 for _, code, _ in results), results)
+        # Each 200 echoes exactly the set that request committed.
+        for tag, _, echoed in results:
+            self.assertEqual(echoed, sets[tag])
+        # The child stayed parked at the same pause throughout.
+        self.assertEqual(self.state()["status"], "paused")
+        self.assertEqual(self.state()["pause_seq"], seq)
+        # Last-writer-won set is one of the legal sets; force a known-good
+        # one and prove the protocol still works: continue stops at line 3.
+        self.assertIn(self.state()["breakpoints"], sets)
+        res = self.client.post("/api/breakpoints", json={
+            "run_id": run_id, "pause_seq": seq, "breakpoints": [3]})
+        self.assertEqual(res.status_code, 200)
+        self.cont(run_id, seq)
+        self.wait_line(3)
+        self.cleanup_run(run_id)
+
+    def test_state_reports_breakpoints_throughout_lifecycle(self):
+        run_id = self.start_run("x = 1\nx = 2\n", breakpoints=[2])
+        self.wait_paused()
+        self.assertEqual(self.state()["breakpoints"], [2])
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_line(2)
+        self.assertEqual(self.state()["breakpoints"], [2])
+        seq = self.state()["pause_seq"]
+        self.cont(run_id, seq)
+        self.wait_status("finished")
+        # Terminal state still reports the configuration that was in effect.
+        self.assertEqual(self.state()["breakpoints"], [2])
+
+    def test_parse_breakpoints_helper_rules(self):
+        good = [
+            (None, 5, []),
+            ([], 5, []),
+            ([1], 5, [1]),
+            ([5, 1, 1, 3], 5, [1, 3, 5]),
+        ]
+        for raw, n, expected in good:
+            got, err = appmod.parse_breakpoints(raw, n)
+            self.assertIsNone(err, (raw, err))
+            self.assertEqual(got, expected)
+        bad = [[0], [-1], [6], [1.0], [True], [False], ["1"], [None],
+               [1, "x"], [[1]], [{"a": 1}], "1", 1, object()]
+        for raw in bad:
+            got, err = appmod.parse_breakpoints(raw, 5)
+            self.assertIsNone(got, raw)
+            self.assertIsNotNone(err, raw)
+
+
 class DelayedResponseTests(unittest.TestCase):
     """Cross-run async chain: old in-flight replies delayed across the
     admission of a new run.
@@ -883,8 +1273,11 @@ class DelayedResponseTests(unittest.TestCase):
     def state(self):
         return self.client.get("/api/state").get_json()
 
-    def start_run(self, code=SIMPLE_CODE):
-        res = self.client.post("/api/run", json={"code": code})
+    def start_run(self, code=SIMPLE_CODE, breakpoints=None):
+        body = {"code": code}
+        if breakpoints is not None:
+            body["breakpoints"] = breakpoints
+        res = self.client.post("/api/run", json=body)
         self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
         return res.get_json()["run_id"]
 
@@ -1354,6 +1747,101 @@ class DelayedResponseTests(unittest.TestCase):
         self.assertEqual(result["body"]["run_id"], old_id)
         self.assertEqual(self.state()["run_id"], new_id)
         self.cleanup_run(new_id)
+
+    # ---- parked /api/breakpoints replies never hold COND ---------------
+
+    def test_parked_breakpoint_reply_never_blocks_controls_and_409_late(self):
+        old_id = self.start_run("x = 1\ny = 2\n", breakpoints=[1])
+        self.wait_paused(old_id)
+        self.assertEqual(self.state()["breakpoints"], [1])
+
+        gates = self._make_gates(["/api/breakpoints"])
+        client = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            # A valid replacement reply (200) is fully built -- including the
+            # child command write and the committed set -- then parked.
+            self.arm(gates, "/api/breakpoints")
+            t, result = self.call_in_thread(
+                client, "POST", "/api/breakpoints", "/api/breakpoints",
+                gates, json_body={"run_id": old_id, "pause_seq": 1,
+                                  "breakpoints": [2]})
+            self.wait_entered(gates, "/api/breakpoints")
+
+            # The set is committed under COND while the reply is parked;
+            # unrelated requests still flow (no lock is held by the reply).
+            self.assertEqual(self.state()["breakpoints"], [2])
+            # The pause is NOT consumed by a breakpoint replacement: step is
+            # accepted at the same pause_seq.
+            step = self.client.post(
+                "/api/step", json={"run_id": old_id, "pause_seq": 1})
+            self.assertEqual(step.status_code, 200)
+            self.assertTrue(wait_for(
+                lambda: self.state()["run_id"] == old_id
+                and self.state()["status"] == "paused"
+                and self.state()["pause_seq"] == 2))
+
+            # Now terminate and admit a new run while the old 200 is parked.
+            self.assertEqual(
+                self.client.post(
+                    "/api/terminate", json={"run_id": old_id}).status_code, 200)
+            new_id = self.start_run()
+            self.wait_paused(new_id)
+            self.assertEqual(self.state()["breakpoints"], [])
+
+            self.release(gates, "/api/breakpoints")
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+
+        # The late 200 still self-describes the old pause; the new run's
+        # configuration was never touched by it.
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["body"]["ok"], True)
+        self.assertEqual(result["body"]["pause_seq"], 1)
+        self.assertEqual(result["body"]["breakpoints"], [2])
+        self.assertEqual(self.state()["run_id"], new_id)
+        self.assertEqual(self.state()["breakpoints"], [])
+        self.cleanup_run(new_id)
+
+    def test_parked_breakpoint_400_then_409_leave_config_intact(self):
+        run_id = self.start_run("x = 1\ny = 2\n", breakpoints=[1])
+        self.wait_paused(run_id)
+
+        gates = self._make_gates(["/api/breakpoints"])
+        client = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            # A 400 reply parked: validation failed, nothing was committed.
+            self.arm(gates, "/api/breakpoints")
+            t400, r400 = self.call_in_thread(
+                client, "POST", "/api/breakpoints", "/api/breakpoints",
+                gates, json_body={"run_id": run_id, "pause_seq": 1,
+                                  "breakpoints": [5]})
+            self.wait_entered(gates, "/api/breakpoints")
+            self.assertEqual(self.state()["breakpoints"], [1])
+            self.release(gates, "/api/breakpoints")
+            t400.join(timeout=10)
+
+            # Consume the pause; a stale replacement must 409 even though the
+            # set it proposes is legal.
+            self.assertEqual(self.client.post(
+                "/api/step", json={"run_id": run_id, "pause_seq": 1}
+            ).status_code, 200)
+            self.assertTrue(wait_for(
+                lambda: self.state()["pause_seq"] == 2))
+            self.arm(gates, "/api/breakpoints")
+            t409, r409 = self.call_in_thread(
+                client, "POST", "/api/breakpoints", "/api/breakpoints",
+                gates, json_body={"run_id": run_id, "pause_seq": 1,
+                                  "breakpoints": [2]})
+            self.wait_entered(gates, "/api/breakpoints")
+            self.assertEqual(self.state()["breakpoints"], [1])
+            self.release(gates, "/api/breakpoints")
+            t409.join(timeout=10)
+            self.assertFalse(t400.is_alive() or t409.is_alive())
+
+        self.assertEqual(r400["status"], 400)
+        self.assertEqual(r409["status"], 409)
+        self.assertEqual(self.state()["breakpoints"], [1])
+        self.cleanup_run(run_id)
 
 
 @unittest.skipUnless(shutil.which("node"), "node is required for the JS frontend race checks")

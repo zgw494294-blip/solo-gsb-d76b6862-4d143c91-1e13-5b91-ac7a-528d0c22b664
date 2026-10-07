@@ -60,6 +60,15 @@ let liveState = null;    // latest /api/state snapshot for runId (monotonic)
 let pauses = [];         // pause snapshots returned by /api/pauses (asc seq)
 let viewingSeq = null;   // selected historical pause_seq, or null = live view
 let historySig = "";     // dropdown contents signature, to avoid rebuilding
+// Effective breakpoints of the current run (sorted line numbers), exactly as
+// the server reports them in /api/state; [] before/without a run. The text
+// box is a draft that is (re)synchronised only on adoption events (run
+// admitted, a fresh live pause, or an accepted/rejected replacement) -- see
+// syncBreakpointInput -- so typing and polling never fight each other.
+let activeBreakpoints = [];
+// Key (run_id + ":" + pause_seq + ":" + status) of the last state that the
+// breakpoint input was synchronised from.
+let bpInputKey = "";
 // 同一运行内重叠的轮询（400ms 定时轮询与手动/控制触发的 poll）可能乱序返回：
 // 较晚轮询采纳的状态/历史一旦落地，较早轮询的迟到响应不得再回退任何视图。
 // 快照在服务端只随时间前进，因此以“已采纳内容”为单调高水位即可识别旧响应，
@@ -132,7 +141,56 @@ function setRunningUI(running) {
   if (running) {
     $("btn-step").disabled = true;
     $("btn-continue").disabled = true;
+    $("btn-apply-bp").disabled = true;  // 仅实时暂停时可整组替换
   }
+}
+
+// ---- breakpoints ---------------------------------------------------------
+
+// Parse the breakpoint text field into sorted unique integers.
+// Returns {ok: true, lines: [...]} or {ok: false}. Accepted tokens are
+// integers separated by commas or whitespace; booleans/floats/words and
+// out-of-range numbers are rejected. Range validation mirrors the server
+// (1..number of source lines); blank/comment lines are accepted here and
+// simply never hit, matching the server contract.
+function parseBreakpointText(text, lineCount) {
+  const tokens = String(text == null ? "" : text)
+    .split(/[\s,，;；]+/).filter((t) => t !== "");
+  const set = new Set();
+  for (const tok of tokens) {
+    if (!/^[+-]?\d+$/.test(tok)) return { ok: false };
+    const n = Number(tok);
+    if (!Number.isInteger(n) || n < 1 || n > lineCount) return { ok: false };
+    set.add(n);
+  }
+  return { ok: true, lines: Array.from(set).sort((a, b) => a - b) };
+}
+
+function breakpointInputKey(state) {
+  return `${state.run_id}:${state.pause_seq}:${state.status}`;
+}
+
+// (Re)synchronise the breakpoint text field with the server-effective set.
+// Done only when a new run is admitted or a NEW live pause arrives (and
+// after apply responses), never on plain same-pause polls, so a user typing
+// at a pause is not interrupted, and history review never edits the draft.
+function syncBreakpointInput(state) {
+  const key = breakpointInputKey(state);
+  if (key === bpInputKey) return;
+  bpInputKey = key;
+  activeBreakpoints = Array.from(state.breakpoints || []);
+  $("breakpoints").value = activeBreakpoints.join(", ");
+}
+
+// The field/button are editable only in the live view (not while reviewing
+// history) and the button additionally only at a live pause.
+function refreshBreakpointEditor() {
+  $("breakpoints").disabled = inHistoryMode();
+  $("btn-apply-bp").disabled =
+    inHistoryMode()
+    || !liveState
+    || liveState.status !== "paused"
+    || liveState.run_id !== runId;
 }
 
 function startPolling() {
@@ -160,11 +218,23 @@ async function postJSON(url, body) {
 
 async function startRun() {
   showMessage("");
+  // Validate breakpoints before the request: a 400 must not start a run or
+  // change the current one. The text field stays as the user typed it.
+  const lineCount = $("code").value.split("\n").length;
+  const parsed = parseBreakpointText($("breakpoints").value, lineCount);
+  if (!parsed.ok) {
+    showMessage(`断点无效：请填写 1 到 ${lineCount} 之间的整数行号，用逗号或空格分隔`);
+    return;
+  }
+  const myBreakpoints = parsed.lines;
   // 记录本次启动尝试对应的归属代际：响应返回后若已有更晚的获准启动
   // （双击/快速重跑：先回 200 的请求已经切走归属），这个迟到结果必须
   // 静默丢弃，不得再改提示，更不能清空/切回当前运行的历史与视图。
   const myAdmitSeq = admitSeq;
-  const { ok, data } = await postJSON("/api/run", { code: $("code").value });
+  const { ok, data } = await postJSON("/api/run", {
+    code: $("code").value,
+    breakpoints: myBreakpoints,
+  });
   if (!ok) {
     if (admitSeq !== myAdmitSeq) return;  // 已有获准的新运行：静默丢弃
     // 启动被拒绝（如活动运行冲突）：不清空既有停顿，也不切走当前视图
@@ -180,11 +250,14 @@ async function startRun() {
   pauseSeq = 0;
   liveState = null;
   pauses = [];
+  activeBreakpoints = myBreakpoints;  // admitted exactly as sent
+  bpInputKey = "";                    // first poll/pause re-syncs the field
   historySig = null;  // 强制下次重建下拉框，清掉上一个运行的停顿条目
   exitHistoryView();
   showMessage("");    // 清掉同批失败请求可能已显示的 409 提示
   populateHistory();
   setRunningUI(true);
+  refreshBreakpointEditor();
   renderStatusBadge("running");  // 归属切换：徽标立即属于新运行，旧终态不再停留
   startPolling();
 }
@@ -197,6 +270,7 @@ async function control(kind) {
   // 同一次停顿只发一次；服务端也会拒绝重复/过期请求
   $("btn-step").disabled = true;
   $("btn-continue").disabled = true;
+  $("btn-apply-bp").disabled = true;  // 停顿已被消费：替换请求只会收到 409
   const { ok, data } = await postJSON(`/api/${kind}`, {
     run_id: myRunId,
     pause_seq: pauseSeq,  // 始终用实时 pause_seq，绝不用历史序号推进
@@ -217,6 +291,51 @@ async function terminateRun() {
   if (runId !== myRunId) return;  // 旧终止请求的迟到响应不得作用于新运行
   if (!ok) showMessage(data.error || "终止失败");
   poll();
+}
+
+// Replace the whole breakpoint set of the current live pause. This neither
+// steps nor continues: execution stays parked at the same pause (the server
+// keeps its pause_seq and appends no snapshot), so after success we only
+// adopt the effective set locally.
+async function applyBreakpoints() {
+  if (!runId || inHistoryMode()) return;
+  const myRunId = runId;
+  const mySeq = pauseSeq;  // always the live pause seq, never a history one
+  const lineCount = liveState && Array.isArray(liveState.lines)
+    ? liveState.lines.length
+    : $("code").value.split("\n").length;
+  const parsed = parseBreakpointText($("breakpoints").value, lineCount);
+  if (!parsed.ok) {
+    showMessage(`断点无效：请填写 1 到 ${lineCount} 之间的整数行号，用逗号或空格分隔`);
+    return;
+  }
+  const { ok, data } = await postJSON("/api/breakpoints", {
+    run_id: myRunId,
+    pause_seq: mySeq,
+    breakpoints: parsed.lines,
+  });
+  // A late response after a new run was admitted: never touch the new run.
+  if (runId !== myRunId) return;
+  if (ok) {
+    showMessage("");
+    activeBreakpoints = Array.from(data.breakpoints || parsed.lines);
+    if (liveState) liveState.breakpoints = activeBreakpoints.slice();
+    // Pin the field to the effective set; mark this pause as already synced
+    // so the next identical poll does not clobber a follow-up edit.
+    $("breakpoints").value = activeBreakpoints.join(", ");
+    bpInputKey = `${myRunId}:${mySeq}:paused`;
+    // Reflect the replaced markers immediately; no state/poll changed.
+    if (liveState && !inHistoryMode()) renderView(liveState);
+    return;  // no poll: nothing advanced and no snapshot was added
+  }
+  // 409 (stale/consumed/non-paused): refresh from the server, which also
+  // re-syncs the field to the current effective set via syncBreakpointInput.
+  // 400 leaves configuration untouched and keeps the user's draft/message.
+  if (data && /不在暂停|过期|重复/.test(data.error || "")) {
+    setTimeout(poll, 0);
+  } else {
+    showMessage((data && data.error) || "断点设置失败");
+  }
 }
 
 async function fetchPauses(forRunId) {
@@ -259,6 +378,14 @@ async function poll() {
   liveState = data;
   pauseSeq = data.pause_seq;
 
+  // Reflect the server-effective breakpoints. The text field is re-synced
+  // only when the live pausing point changes (new run / new pause), so
+  // same-pause polls never overwrite an in-progress edit; history review
+  // leaves the editor alone entirely.
+  activeBreakpoints = Array.from(data.breakpoints || []);
+  if (!inHistoryMode()) syncBreakpointInput(data);
+  refreshBreakpointEditor();
+
   // 有效终态立即收尾：停轮询、恢复编辑与重跑。绝不等待本轮 /api/pauses
   // 完成——历史请求可能长期在途（甚至永不返回），而页面之后持续发起的
   // 轮询若都持有终态，旧实现会一直无法收尾、整页只读且不能重跑。
@@ -269,6 +396,7 @@ async function poll() {
     // 时也不能短暂亮起；历史模式本就禁用，这里再置一次同样无害。
     $("btn-step").disabled = true;
     $("btn-continue").disabled = true;
+    refreshBreakpointEditor();  // 终态：应用按钮禁用；输入框能否编辑取决于是否回看
   }
 
   renderAdoptedState(data);
@@ -342,7 +470,8 @@ function renderStatusBadge(status) {
 
 function renderView(state) {
   renderStatusBadge(state.status);
-  renderListing(state.lines, state.current_line, state.status !== "finished");
+  renderListing(state.lines, state.current_line, state.status !== "finished",
+    state.breakpoints || []);
   renderLocals(state.locals);
 
   let out = state.stdout || "";
@@ -353,12 +482,15 @@ function renderView(state) {
   const paused = state.status === "paused";
   $("btn-step").disabled = !paused;
   $("btn-continue").disabled = !paused;
+  refreshBreakpointEditor();
 }
 
 function renderHistory(pause) {
-  // 历史快照：定格当时的待执行行/局部变量/已保留输出；不改动状态徽标
+  // 历史快照：定格当时的待执行行/局部变量/已保留输出；不改动状态徽标。
+  // 断点槽位仍按当前生效集合标记（标记只说明配置，历史模式下不可编辑）。
   const lines = liveState ? liveState.lines : [];
-  renderListing(lines, pause.current_line, true);
+  renderListing(lines, pause.current_line, true,
+    liveState ? (liveState.breakpoints || []) : []);
   renderLocals(pause.locals);
   let out = pause.stdout || "";
   if (pause.stdout_truncated) out = "（输出过长，仅保留末尾部分）\n" + out;
@@ -366,21 +498,30 @@ function renderHistory(pause) {
   $("exception").textContent = "";
   $("btn-step").disabled = true;
   $("btn-continue").disabled = true;
+  refreshBreakpointEditor();
 }
 
-function renderListing(lines, currentLine, highlight) {
+function renderListing(lines, currentLine, highlight, breakpoints) {
+  const bpSet = new Set(breakpoints || []);
   const listing = $("listing");
   listing.textContent = "";
   listing.classList.remove("empty");
   lines.forEach((text, i) => {
-    const isCurrent = highlight && i + 1 === currentLine;
+    const lineNo = i + 1;
+    const isCurrent = highlight && lineNo === currentLine;
+    const hasBreakpoint = bpSet.has(lineNo);
     const row = document.createElement("div");
     row.className = "code-line";
     if (isCurrent) row.classList.add("current");
+    if (hasBreakpoint) row.classList.add("breakpoint");
     const gutter = document.createElement("span");
     gutter.className = "gutter";
-    gutter.textContent = (isCurrent ? "→ " : "  ")
-      + String(i + 1).padStart(2, " ");
+    // Two fixed slots: an execution arrow and a breakpoint dot, so all
+    // gutter columns stay aligned whether either marker is present.
+    const arrow = isCurrent ? "→" : " ";
+    const dot = hasBreakpoint ? "●" : "·";
+    gutter.textContent = arrow + " " + dot + " "
+      + String(lineNo).padStart(2, " ");
     const code = document.createElement("span");
     code.className = "text";
     code.textContent = text || " ";
@@ -445,13 +586,14 @@ function enterHistoryView(seq) {
   viewingSeq = String(seq);
   $("history").value = viewingSeq;
   $("history-banner").hidden = false;
-  renderHistory(pause);
+  renderHistory(pause);  // also disables breakpoint editing
 }
 
 function exitHistoryView() {
   viewingSeq = null;
   $("history").value = "";
   $("history-banner").hidden = true;
+  refreshBreakpointEditor();  // live view: re-evaluate field/button state
 }
 
 function showLive(state, message) {
@@ -476,6 +618,7 @@ $("btn-run").addEventListener("click", startRun);
 $("btn-step").addEventListener("click", () => control("step"));
 $("btn-continue").addEventListener("click", () => control("continue"));
 $("btn-terminate").addEventListener("click", terminateRun);
+$("btn-apply-bp").addEventListener("click", applyBreakpoints);
 $("btn-back-live").addEventListener("click", returnToLive);
 $("history").addEventListener("change", (e) => {
   const value = e.target.value;
@@ -496,3 +639,4 @@ $("examples").addEventListener("change", (e) => {
 });
 
 updateLineCount();
+refreshBreakpointEditor();

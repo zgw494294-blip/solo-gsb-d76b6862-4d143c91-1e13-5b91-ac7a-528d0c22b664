@@ -120,12 +120,13 @@ function makeOption() {
 const IDS = ["code", "examples", "btn-run", "btn-step", "btn-continue",
   "btn-terminate", "btn-back-live", "history", "message", "status",
   "line-count", "listing", "stdout", "exception", "history-banner",
-  "locals"];
+  "locals", "breakpoints", "btn-apply-bp", "bp-hint"];
 const elements = {};
 for (const id of IDS) elements[id] = makeElement(id);
 elements["btn-step"].disabled = true;
 elements["btn-continue"].disabled = true;
 elements["btn-terminate"].disabled = true;
+elements["btn-apply-bp"].disabled = true;
 elements["history-banner"].hidden = true;
 
 const documentStub = {
@@ -218,6 +219,7 @@ function state(id, status, seq, extra = {}) {
     stdout_truncated: false,
     exception: null,
     lines: LINES,
+    breakpoints: [],
   }, extra);
 }
 function pause(seq, line = seq, locals = seq >= 2 ? { x: String(seq - 1) } : {}) {
@@ -241,16 +243,28 @@ async function answerPoll(id, st, pauseList) {
 }
 const optionTexts = () => elements.history.children.map((o) => o.textContent);
 const activeIntervals = () => Array.from(intervals.keys());
-// The gutter of the highlighted row ("→ NN") as rendered by renderListing.
+// The gutter of the highlighted row starts with an execution arrow ("→")
+// as rendered by renderListing; format: "→ ● NN" or "→ · NN".
 function markedLine() {
   for (const row of elements.listing.children) {
     const gutter = row.children[0];
-    if (gutter && gutter.textContent.startsWith("→")) {
-      return Number(gutter.textContent.trim().slice(1));
+    if (gutter && gutter.textContent.trimStart().startsWith("→")) {
+      const m = gutter.textContent.match(/(\d+)\s*$/);
+      return m ? Number(m[1]) : null;
     }
   }
   return null;
 }
+// Source line numbers whose gutter carries the breakpoint dot ("●").
+function markedBreakpointLines() {
+  const lines = [];
+  elements.listing.children.forEach((row, i) => {
+    const gutter = row.children[0];
+    if (gutter && /^.\s●\s/.test(gutter.textContent)) lines.push(i + 1);
+  });
+  return lines;
+}
+const isBreakpoints = (r) => r.url === "/api/breakpoints";
 
 // Drop every request still pending from a previous scenario: those poll
 // chains captured an older run id and their resolution is irrelevant to the
@@ -1088,6 +1102,247 @@ async function scenarioTerminalHistoryNeverReturnsThenNewRun() {
   check(!elements["btn-step"].disabled, "[13] new run's step enabled");
 }
 
+// ===========================================================================
+// Scenario 14: breakpoints travel with /api/run, are displayed in the
+// gutter and field, can be replaced at a live pause via POST
+// /api/breakpoints (no advance, no extra poll), a 400 changes nothing, and
+// a continue request afterwards carries the live pause_seq.
+// ===========================================================================
+
+async function scenarioBreakpointsAdmittedAppliedAndDisplayed() {
+  await resetForScenario();
+  elements.code.value = LINES.join("\n");
+  elements.breakpoints.value = "3, 3, 2";
+
+  const startP = evalApp("startRun()");
+  await tick();
+  const reqRun = take(isRun, "[14] POST /api/run");
+  // The admission request carried the parsed, sorted/deduped set.
+  eq(JSON.stringify(JSON.parse(reqRun.body).breakpoints), "[2,3]",
+    "[14] /api/run carries sorted/deduped breakpoints");
+  reqRun.resolve(jsonResponse(200, { run_id: "bp1" }));
+  await startP;
+  await tick();
+
+  await answerPoll("bp1",
+    state("bp1", "paused", 1, {
+      current_line: 1, breakpoints: [2, 3],
+    }),
+    [pause(1, 1, {})]);
+  eq(elements.breakpoints.value, "2, 3",
+    "[14] field shows the effective sorted/deduped breakpoints");
+  eq(JSON.stringify(markedBreakpointLines()), JSON.stringify([2, 3]),
+    "[14] gutter marks both breakpoint lines");
+  check(!elements.breakpoints.disabled, "[14] field editable at live pause");
+  check(!elements["btn-apply-bp"].disabled,
+    "[14] apply button enabled at live pause");
+
+  // Replace the whole set at the live pause.
+  elements.breakpoints.value = "1, 3";
+  const applyP = evalApp("applyBreakpoints()");
+  await tick();
+  const reqBp = take(isBreakpoints, "[14] POST /api/breakpoints");
+  eq(JSON.parse(reqBp.body).run_id, "bp1", "[14] replace carries run_id");
+  eq(JSON.parse(reqBp.body).pause_seq, 1, "[14] replace carries live seq");
+  eq(JSON.stringify(JSON.parse(reqBp.body).breakpoints), "[1,3]",
+    "[14] replace carries the new whole set");
+  const statesWhileApplying = pending.filter(isState).length;
+  reqBp.resolve(jsonResponse(200,
+    { ok: true, pause_seq: 1, breakpoints: [1, 3] }));
+  await applyP;
+  await tick();
+  await flushTimeouts();
+  eq(pending.filter(isState).length, statesWhileApplying,
+    "[14] accepted replace triggers no poll (no advance)");
+  eq(elements.message.textContent, "", "[14] no message on accepted replace");
+  eq(JSON.stringify(markedBreakpointLines()), JSON.stringify([1, 3]),
+    "[14] gutter shows the replaced set immediately");
+  eq(elements.breakpoints.value, "1, 3",
+    "[14] field pinned to the effective replaced set");
+
+  // A server-side 400 (e.g. a validation the page could not pre-empt)
+  // changes nothing: the field draft and markers stay as they are, and the
+  // pause is still consumable. The client-side range guard makes "9" fail
+  // locally without a request, so here the text is in range while the
+  // server still answers 400 (its range rules are the contract under test).
+  elements.breakpoints.value = "2";
+  const badP = evalApp("applyBreakpoints()");
+  await tick();
+  take(isBreakpoints, "[14] bad POST /api/breakpoints")
+    .resolve(jsonResponse(400, { error: "断点行号必须是整数" }));
+  await badP;
+  await tick();
+  eq(elements.message.textContent, "断点行号必须是整数",
+    "[14] 400 shows the server error");
+  eq(JSON.stringify(markedBreakpointLines()), JSON.stringify([1, 3]),
+    "[14] 400 does not change effective markers");
+  // Local draft is kept so the user can fix it.
+  eq(elements.breakpoints.value, "2", "[14] 400 keeps the user's draft");
+
+  // Continue is still available and sends the live pause_seq.
+  const contP = evalApp('control("continue")');
+  await tick();
+  const reqCont = take(isControl("continue"), "[14] POST /api/continue");
+  eq(JSON.parse(reqCont.body).pause_seq, 1,
+    "[14] continue uses the unchanged live pause_seq");
+  reqCont.resolve(jsonResponse(200, { ok: true, pause_seq: 1 }));
+  await contP;
+  await tick();
+  await flushTimeouts();  // control() schedules one follow-up poll
+  // Next poll: paused at a breakpoint hit (line 3), server reports the set.
+  take(isState).resolve(jsonResponse(200,
+    state("bp1", "paused", 2, { current_line: 3, breakpoints: [1, 3] })));
+  await tick();
+  take(pausesFor("bp1")).resolve(jsonResponse(200, {
+    run_id: "bp1",
+    pauses: [pause(1, 1, {}), pause(2, 3, { x: "1" })],
+  }));
+  await tick();
+  eq(markedLine(), 3, "[14] continue stopped at the breakpoint line");
+  eq(elements.breakpoints.value, "1, 3",
+    "[14] new pause re-syncs field to effective set");
+}
+
+// ===========================================================================
+// Scenario 15: breakpoint editing is disabled while reviewing history and
+// re-enabled on return to live; markers still reflect the effective set.
+// ===========================================================================
+
+async function scenarioBreakpointEditingDisabledInHistory() {
+  await resetForScenario();
+  elements.breakpoints.value = "2";
+  await admitRun("bp2");
+  await answerPoll("bp2",
+    state("bp2", "paused", 2, {
+      current_line: 2, breakpoints: [2],
+    }),
+    [pause(1, 1, {}), pause(2, 2, { x: "1" })]);
+  check(!elements["btn-apply-bp"].disabled,
+    "[15] apply enabled at the live pause");
+
+  elements.history.value = "1";
+  elements.history.dispatch("change", { target: elements.history });
+  await tick();
+  check(elements.breakpoints.disabled, "[15] field disabled in history mode");
+  check(elements["btn-apply-bp"].disabled,
+    "[15] apply disabled in history mode");
+  // Calling apply from history mode must not even issue a request.
+  const before = pending.length;
+  await evalApp("applyBreakpoints()");
+  await tick();
+  eq(pending.length, before, "[15] apply in history mode sends no request");
+  // Markers are still rendered while reviewing.
+  eq(JSON.stringify(markedBreakpointLines()), JSON.stringify([2]),
+    "[15] effective markers remain visible in history review");
+
+  // Return to live: editing is re-enabled from the fresh state.
+  const backP = evalApp("returnToLive()");
+  await tick();
+  take(isState).resolve(jsonResponse(200,
+    state("bp2", "paused", 2, { current_line: 2, breakpoints: [2] })));
+  await tick();
+  take(pausesFor("bp2")).resolve(jsonResponse(200, {
+    run_id: "bp2",
+    pauses: [pause(1, 1, {}), pause(2, 2, { x: "1" })],
+  }));
+  await backP;
+  await tick();
+  check(!elements.breakpoints.disabled, "[15] field re-enabled back live");
+  check(!elements["btn-apply-bp"].disabled,
+    "[15] apply re-enabled back live");
+
+  // At a terminal state the field may be edited for the next run but apply
+  // stays disabled (nothing is paused).
+  const finishChain = evalApp("poll()");
+  await tick();
+  take(isState).resolve(jsonResponse(200,
+    state("bp2", "finished", 2, { breakpoints: [2] })));
+  await tick();
+  take(pausesFor("bp2")).resolve(jsonResponse(200, {
+    run_id: "bp2",
+    pauses: [pause(1, 1, {}), pause(2, 2, { x: "1" })],
+  }));
+  await finishChain;
+  await tick();
+  check(elements["btn-apply-bp"].disabled,
+    "[15] apply disabled at terminal state");
+  check(!elements.breakpoints.disabled,
+    "[15] field editable at terminal state for the next run");
+}
+
+// ===========================================================================
+// Scenario 16: breakpoint admission and replacement responses landing after
+// a newer run is admitted must not affect it; a 400 on /api/run must not
+// start anything; a 409 on a stale /api/breakpoints neither changes the set
+// nor adds polling for the new run.
+// ===========================================================================
+
+async function scenarioStaleBreakpointResponsesDroppedAcrossRuns() {
+  await resetForScenario();
+  elements.breakpoints.value = "2";
+  await admitRun("bp3");
+  await answerPoll("bp3",
+    state("bp3", "paused", 1, { breakpoints: [2] }), [pause(1, 1, {})]);
+
+  // A replacement is in flight when a new run gets admitted (the page never
+  // allows that via UI, but the late reply must still be inert).
+  const applyP = evalApp("applyBreakpoints()");
+  await tick();
+  const reqBp = take(isBreakpoints, "[16] POST /api/breakpoints");
+  elements.breakpoints.value = "";
+  await admitRun("bp4");
+  const statesBefore = pending.filter(isState).length;
+  reqBp.resolve(jsonResponse(200,
+    { ok: true, pause_seq: 1, breakpoints: [3] }));
+  await applyP;
+  await tick();
+  await flushTimeouts();
+  eq(elements.message.textContent, "",
+    "[16] late old replace 200 shows no message on the new run");
+  check(pending.filter(isState).length === statesBefore,
+    "[16] late old replace schedules no poll");
+
+  // The new run's first state carries its own (empty) effective set: the
+  // late [3] never became the markers/field.
+  await answerPoll("bp4",
+    state("bp4", "paused", 1, { breakpoints: [] }), [pause(1, 1, {})]);
+  eq(elements.breakpoints.value, "",
+    "[16] new run field is the new run's empty set");
+  eq(markedBreakpointLines().length, 0, "[16] new run has no markers");
+
+  // A stale 409 (old run / consumed pause) is likewise harmless.
+  elements.breakpoints.value = "2";
+  const staleP = evalApp("applyBreakpoints()");
+  await tick();
+  const reqStale = take(isBreakpoints, "[16] stale replace");
+  await admitRun("bp5");
+  const statesBefore2 = pending.filter(isState).length;
+  reqStale.resolve(jsonResponse(409,
+    { error: "重复或过期的请求，已拒绝且未推进" }));
+  await staleP;
+  await tick();
+  await flushTimeouts();
+  eq(elements.message.textContent, "",
+    "[16] late old replace 409 stays silent across runs");
+  check(pending.filter(isState).length === statesBefore2,
+    "[16] cross-run 409 triggers no poll for the new run");
+  await answerPoll("bp5",
+    state("bp5", "paused", 1, { breakpoints: [] }), [pause(1, 1, {})]);
+  eq(elements.breakpoints.value, "",
+    "[16] newest run keeps its own empty effective set");
+
+  // Client-side validation: an illegal field blocks /api/run with no request.
+  elements.breakpoints.value = "1, x";
+  const runP = evalApp("startRun()");
+  await tick();
+  check(pending.filter(isRun).length === 0,
+    "[16] invalid breakpoints block the run request");
+  await runP;
+  await tick();
+  check(/断点无效/.test(elements.message.textContent),
+    "[16] invalid local breakpoint text reports an error");
+}
+
 async function main() {
   await scenarioTwoOldPollChains();
   await scenarioLateStepResponse();
@@ -1102,6 +1357,9 @@ async function main() {
   await scenarioTerminalKeepsRetainedReview();
   await scenarioTerminalHistoryFailureNoFalseEviction();
   await scenarioTerminalHistoryNeverReturnsThenNewRun();
+  await scenarioBreakpointsAdmittedAppliedAndDisplayed();
+  await scenarioBreakpointEditingDisabledInHistory();
+  await scenarioStaleBreakpointResponsesDroppedAcrossRuns();
   await tick();
   await flushTimeouts();
   mainSettled = true;

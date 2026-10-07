@@ -28,6 +28,15 @@
       <textarea id="code" spellcheck="false"
         placeholder="在此输入最多 {{ max_lines }} 行 Python 代码（不支持 input() 与第三方包）"></textarea>
       <div class="toolbar">
+        <label class="bp-edit">断点行号：
+          <input id="breakpoints" type="text" inputmode="numeric"
+            spellcheck="false" autocomplete="off"
+            placeholder="如 3, 7（逗号或空格分隔，留空表示无断点）">
+        </label>
+        <button id="btn-apply-bp" type="button" disabled>应用断点</button>
+        <span id="bp-hint" class="hint">运行前随启动生效；实时暂停时整组替换；回看历史时不可编辑</span>
+      </div>
+      <div class="toolbar">
         <button id="btn-run" class="primary">▶ 运行</button>
         <button id="btn-step" disabled>单步</button>
         <button id="btn-continue" disabled>继续</button>

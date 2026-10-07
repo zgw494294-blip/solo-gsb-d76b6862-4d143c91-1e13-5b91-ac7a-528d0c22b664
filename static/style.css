@@ -93,6 +93,20 @@ select {
 #line-count { font-size: 13px; color: #9aa0ad; }
 #line-count.over { color: #ff7a6e; font-weight: 600; }
 
+.bp-edit { font-size: 13px; color: #9aa0ad; display: flex; align-items: center; gap: 6px; }
+#breakpoints {
+  background: #141519;
+  color: #e6e8ee;
+  border: 1px solid #33353f;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  width: 260px;
+}
+#breakpoints:disabled { opacity: 0.5; cursor: not-allowed; }
+#btn-apply-bp { padding: 4px 12px; font-size: 13px; }
+
 .message { color: #ffb04d; font-size: 13px; }
 
 .view-pane h2 {
@@ -147,7 +161,7 @@ select {
 
 .code-line { display: flex; white-space: pre; padding: 0 10px 0 0; }
 .code-line .gutter {
-  flex: 0 0 52px;
+  flex: 0 0 66px;
   text-align: right;
   padding-right: 10px;
   color: #5a5e6b;
@@ -156,6 +170,10 @@ select {
 .code-line.current { background: #3d3416; }
 .code-line.current .gutter { color: #ffcf5c; }
 .code-line.current .text { color: #ffe9b0; }
+/* Breakpoint dot in the second gutter slot; the placeholder middle dot
+   ("·") for non-breakpoint lines stays in the muted gutter color. */
+.code-line .gutter { font-variant-east-asian: monospace; }
+.code-line.breakpoint:not(.current) .gutter { color: #ff7a6e; }
 
 #locals {
   width: 100%;

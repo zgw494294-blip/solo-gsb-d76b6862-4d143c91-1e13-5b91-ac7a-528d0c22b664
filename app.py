@@ -4,12 +4,27 @@
 Runs trusted local Python code in a dedicated subprocess (tracer.py) and
 exposes a small JSON API:
 
-  POST /api/run        {code}                       -> {run_id}
-  POST /api/step       {run_id, pause_seq}          -> 200 | 409
-  POST /api/continue   {run_id, pause_seq}          -> 200 | 409
-  POST /api/terminate  {run_id}                     -> 200 | 409
+  POST /api/run        {code, breakpoints?: [N]}  -> {run_id}
+  POST /api/step       {run_id, pause_seq}        -> 200 | 409
+  POST /api/continue   {run_id, pause_seq}        -> 200 | 409
+  POST /api/breakpoints {run_id, pause_seq,
+                         breakpoints: [N]}         -> 200 | 409 | 400
+  POST /api/terminate  {run_id}                   -> 200 | 409
   GET  /api/state                                   -> full run snapshot
   GET  /api/pauses?run_id=...                       -> recent pause snapshots
+
+"continue" runs to the next source line whose number is in the run's
+breakpoint set (pausing before that line executes), then again at every
+later hit (a breakpoint inside a loop stops on each iteration); with an
+empty set it runs to completion/exception as before. The very first pause
+and every "step" are unaffected by breakpoints, and resuming from a pause
+can never pause a second time for the same arrival. The whole breakpoint
+set can additionally be replaced through POST /api/breakpoints while the
+run is paused: the replacement neither advances code nor appends a pause
+snapshot; stale ids, already-consumed pauses and non-paused runs get 409
+without changing the set, and an illegal set gets 400. An illegal set on
+/api/run is 400 and no run is started. Comment/blank lines never produce
+line events, so breakpoints on them simply never hit (they stay stored).
 
 Each pause is snapshotted exactly once, at the moment the pause event is
 applied: pause_seq, the line about to execute, local-variable texts, the
@@ -83,8 +98,33 @@ TERMINAL_STATES = ("finished", "exception", "terminated")
 TRACER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracer.py")
 
 
+def parse_breakpoints(raw, line_count):
+    """Validate a breakpoints payload against the source's line range.
+
+    Returns (sorted_deduped_list, None) or (None, error_message). Every
+    entry must be an int that is not a bool, within 1..line_count; floats,
+    strings and booleans are rejected. Duplicates collapse into one entry.
+    Whether a number names a comment/blank line is intentionally not
+    checked here: such lines never raise line events in the tracer and so
+    never hit, while remaining stored/displayed as configured.
+    """
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list):
+        return None, "断点必须是行号数组"
+    result = set()
+    for item in raw:
+        # bool is a subclass of int: reject true/false explicitly.
+        if not isinstance(item, int) or isinstance(item, bool):
+            return None, "断点行号必须是整数"
+        if not 1 <= item <= line_count:
+            return None, f"断点行号必须在 1 到 {line_count} 之间"
+        result.add(item)
+    return sorted(result), None
+
+
 class Run:
-    def __init__(self, code):
+    def __init__(self, code, breakpoints=()):
         self.run_id = uuid.uuid4().hex
         self.lines = code.splitlines()
         self.status = "running"  # running | paused | finished | exception | terminated
@@ -95,6 +135,10 @@ class Run:
         self.stdout = ""
         self.stdout_truncated = False
         self.exception = None
+        # Active source-line breakpoints (sorted, deduped). Empty == run to
+        # completion on continue. Initialised at admission from /api/run and
+        # replaced wholesale through /api/breakpoints while paused only.
+        self.breakpoints = list(breakpoints)
         # Immutable snapshots of every pause so far, in pause_seq order.
         # Polling / duplicate controls never append; once the list exceeds
         # MAX_PAUSE_HISTORY the oldest entries are dropped and the remaining
@@ -105,6 +149,12 @@ class Run:
         self.proc_started = False    # Popen has returned (or definitively failed)
         self.reaped = False          # child has been waited on
         self.terminate_requested = False  # terminate arrived during startup
+        # Serialises every command write to the child's stdin. Step/continue
+        # writes are mutually exclusive via pause_consumed, but breakpoint
+        # replacements do not consume a pause, so two of them (or one racing
+        # a pipe-error path) could otherwise interleave inside one JSON line
+        # and corrupt the tracer's readline protocol.
+        self.io_lock = threading.Lock()
 
     def snapshot(self):
         return {
@@ -117,6 +167,7 @@ class Run:
             "stdout_truncated": self.stdout_truncated,
             "exception": self.exception,
             "lines": self.lines,
+            "breakpoints": list(self.breakpoints),
         }
 
 
@@ -214,6 +265,34 @@ def _kill_proc(proc):
         pass
 
 
+def _write_locked(proc, message):
+    """Write one newline-terminated JSON command to the child.
+
+    Caller must already hold the run's io_lock. Returns False when the pipe
+    is already broken.
+    """
+    try:
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+    return True
+
+
+def _write_command(run, proc, message):
+    """Write one newline-terminated JSON command to the child.
+
+    Takes the run's io_lock so concurrent breakpoint replacements (which do
+    not consume a pause) cannot interleave bytes inside a single line.
+    Returns False when the pipe is already broken.
+    """
+    try:
+        with run.io_lock:
+            return _write_locked(proc, message)
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+
+
 @app.get("/")
 def index():
     return render_template("index.html", max_lines=MAX_LINES)
@@ -222,7 +301,9 @@ def index():
 @app.post("/api/run")
 def api_run():
     global CURRENT
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求体必须是 JSON 对象"}), 400
     code = data.get("code")
     if not isinstance(code, str) or not code.strip():
         return jsonify({"error": "代码不能为空"}), 400
@@ -231,6 +312,13 @@ def api_run():
     line_count = len(code.splitlines())
     if line_count > MAX_LINES:
         return jsonify({"error": f"代码最多 {MAX_LINES} 行（当前 {line_count} 行）"}), 400
+    # Breakpoints are validated BEFORE admission: an illegal set is 400 and
+    # never starts a run or disturbs an existing one. Omitting the field is
+    # the empty set (continue then runs to the end).
+    breakpoints, bp_error = parse_breakpoints(
+        data.get("breakpoints"), line_count)
+    if bp_error is not None:
+        return jsonify({"error": bp_error}), 400
 
     # Admission and rejection decisions are resolved inside COND; every
     # response is serialised outside the lock so a delayed/slow reply (a
@@ -264,7 +352,7 @@ def api_run():
                 break
 
         if rejected is None:
-            run = Run(code)
+            run = Run(code, breakpoints)
             CURRENT = run
         else:
             run = None
@@ -319,10 +407,8 @@ def api_run():
     if terminate_won:
         return jsonify({"run_id": run.run_id})
 
-    try:
-        proc.stdin.write(json.dumps({"code": code}) + "\n")
-        proc.stdin.flush()
-    except (BrokenPipeError, OSError):
+    if not _write_command(run, proc,
+                          {"code": code, "breakpoints": breakpoints}):
         with COND:
             if run.status in ACTIVE_STATES:
                 run.status = "exception"
@@ -360,10 +446,7 @@ def _step_or_continue(command):
             payload, status_code = None, 200
     if status_code != 200:
         return jsonify(payload), status_code
-    try:
-        proc.stdin.write(json.dumps({"cmd": command}) + "\n")
-        proc.stdin.flush()
-    except (BrokenPipeError, OSError):
+    if not _write_command(run, proc, {"cmd": command}):
         with COND:
             if run.status in ACTIVE_STATES:
                 run.status = "finished"
@@ -379,6 +462,69 @@ def api_step():
 @app.post("/api/continue")
 def api_continue():
     return _step_or_continue("continue")
+
+
+@app.post("/api/breakpoints")
+def api_breakpoints():
+    """Replace the run's whole breakpoint set while it is paused.
+
+    State/pause_seq checks come first (409, contract-identical to
+    step/continue: stale run, non-paused run, consumed pause); only for the
+    live, unconsumed pause is the new set validated (400), committed and sent
+    to the child. The child receives a "breakpoints" command while parked in
+    user_line: it swaps its set and keeps waiting for step/continue, so
+    execution neither advances nor gains a pause snapshot, and the pause
+    stays unconsumed.
+
+    Replacements do not consume a pause, so several can race. Validation and
+    the 400/409 decisions run under COND alone; only the success path then
+    takes that run's io_lock (lock order is always COND -> io_lock) around
+    the child write and the state commit. Racing replacements therefore
+    serialise and the child applies sets in exactly the order the server
+    commits them, so the reported effective set can never diverge from the
+    child's set. The response itself is built after both locks are released,
+    like every other endpoint, so a parked reply never blocks state polling
+    or lifecycle coordination.
+    """
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求体必须是 JSON 对象"}), 400
+    run_id = data.get("run_id")
+    pause_seq = data.get("pause_seq")
+    with COND:
+        run = CURRENT
+        if run is None or run.run_id != run_id:
+            payload, status_code = {"error": "运行不存在或已过期"}, 409
+        elif run.status != "paused":
+            payload, status_code = {"error": "当前不在暂停状态，请求被拒绝"}, 409
+        elif pause_seq != run.pause_seq or run.pause_consumed:
+            payload, status_code = {"error": "重复或过期的请求，已拒绝且未推进"}, 409
+        else:
+            new_set, bp_error = parse_breakpoints(
+                data.get("breakpoints"), len(run.lines))
+            if bp_error is not None:
+                payload, status_code = {"error": bp_error}, 400
+            else:
+                # Only the success path takes the per-run io_lock (always in
+                # COND -> io_lock order), serialising racing replacements and
+                # any step/continue write: child apply order == commit order.
+                with run.io_lock:
+                    write_ok = _write_locked(run.proc, {
+                        "cmd": "breakpoints",
+                        "breakpoints": list(new_set)})
+                if not write_ok:
+                    if run.status in ACTIVE_STATES:
+                        run.status = "finished"
+                    payload, status_code = {"error": "子进程已退出"}, 409
+                else:
+                    run.breakpoints = list(new_set)
+                    # status_code stays None: the success reply is built
+                    # after the lock section below.
+                    payload, status_code = None, None
+    if status_code is not None:
+        return jsonify(payload), status_code
+    return jsonify({"ok": True, "pause_seq": pause_seq,
+                    "breakpoints": list(new_set)})
 
 
 @app.post("/api/terminate")
